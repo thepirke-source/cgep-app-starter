@@ -43,6 +43,11 @@ jobs:
           terraform_version: 1.6.6
           terraform_wrapper: false
 
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: 'v2.2.4'
+
       - name: Install Conftest
         run: |
           curl -fsSL https://github.com/open-policy-agent/conftest/releases/download/v0.50.0/conftest_0.50.0_Linux_x86_64.tar.gz \
@@ -124,6 +129,35 @@ jobs:
           name: grc-evidence-${{ github.run_id }}
           path: evidence/
           retention-days: 90
+
+      # Lab 4.4 — chain of custody: bundle, keyless-sign with Cosign, push to Object Lock vault.
+      - name: Bundle + sign + upload to vault
+        id: sign
+        if: always()
+        env:
+          VAULT: ${{ vars.EVIDENCE_VAULT }}
+          RUN_ID: ${{ github.run_id }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          BUNDLE="evidence-${RUN_ID}-${SHA}.tar.gz"
+          ( cd evidence && tar czf "../${BUNDLE}" . )
+          shasum -a 256 "${BUNDLE}" | awk '{print $1}' > "${BUNDLE}.sha256"
+
+          # Keyless signature via GitHub OIDC -> Sigstore Fulcio + Rekor.
+          cosign sign-blob --yes --bundle "${BUNDLE}.sig.bundle" "${BUNDLE}"
+
+          # Single-line receipt the auditor and downstream OSCAL consume.
+          printf '{"run_id":"%s","vault":"%s","key":"%s","sha256":"%s","sha_commit":"%s","captured_at_utc":"%s"}\n' \
+            "${RUN_ID}" "${VAULT}" "runs/${RUN_ID}/${BUNDLE}" "$(cat "${BUNDLE}.sha256")" "${SHA}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            > receipt.json
+
+          KEY_PREFIX="runs/${RUN_ID}"
+          aws s3 cp "${BUNDLE}"            "s3://${VAULT}/${KEY_PREFIX}/${BUNDLE}"
+          aws s3 cp "${BUNDLE}.sha256"     "s3://${VAULT}/${KEY_PREFIX}/${BUNDLE}.sha256"
+          aws s3 cp "${BUNDLE}.sig.bundle" "s3://${VAULT}/${KEY_PREFIX}/${BUNDLE}.sig.bundle"
+          aws s3 cp receipt.json           "s3://${VAULT}/${KEY_PREFIX}/receipt.json"
+          echo "bundle_key=${KEY_PREFIX}/${BUNDLE}" >> "$GITHUB_OUTPUT"
 
       - name: Comment on PR
         if: github.event_name == 'pull_request'
